@@ -3,11 +3,11 @@ import sys
 import time
 import asyncio
 import subprocess
+import json
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.compute import ComputeManagementClient
 
-# Configuration - Edit these
-SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID", input("Enter Subscription ID: "))
+# Configuration - Edit VM list only!
 VM_CONFIG = {
     "vm-web-01": "rg-east-prod",
     "vm-db-01": "rg-central-dev", 
@@ -16,20 +16,19 @@ VM_CONFIG = {
 }
 
 def check_az_login():
-    """Check if Azure CLI is logged in, trigger login if needed"""
+    """Check login and get subscription ID automatically"""
     try:
         result = subprocess.run(["az", "account", "show"], capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
-            sub_id = result.stdout.split('"id":"')[1].split('"')[0]
-            print(f"✅ Already logged in to subscription: {sub_id}")
+            account_info = json.loads(result.stdout)
+            global SUBSCRIPTION_ID  
+            SUBSCRIPTION_ID = account_info["id"].split("/")[-1]  # Extract sub ID from /subscriptions/{sub}
+            print(f"✅ Logged in to subscription: {SUBSCRIPTION_ID}")
             return True
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, KeyError):
         pass
     
-    print("🔐 Starting interactive Azure login (browser will open)...")
-    print("Complete login, then return here.")
-    
-    # Interactive az login (handles browser/MFA automatically)
+    print("🔐 Starting interactive Azure login (browser opens)...")
     login_process = subprocess.Popen(["az", "login"], 
                                    stdout=subprocess.PIPE, 
                                    stderr=subprocess.STDOUT, 
@@ -37,20 +36,27 @@ def check_az_login():
                                    bufsize=1,
                                    universal_newlines=True)
     
-    # Stream output and wait for completion
     for line in login_process.stdout:
         print(line.strip())
     
     login_process.wait()
     
     if login_process.returncode == 0:
-        print("✅ Login successful!")
+        # Re-check account after login
+        result = subprocess.run(["az", "account", "show"], capture_output=True, text=True)
+        account_info = json.loads(result.stdout)
+        global SUBSCRIPTION_ID
+        SUBSCRIPTION_ID = account_info["id"].split("/")[-1]
+        print(f"✅ Login successful! Using subscription: {SUBSCRIPTION_ID}")
         return True
-    else:
-        print("❌ Login failed. Exiting.")
-        sys.exit(1)
+    print("❌ Login failed.")
+    sys.exit(1)
 
 async def start_vms():
+    if 'SUBSCRIPTION_ID' not in globals():
+        print("❌ No subscription found. Run az account set first.")
+        sys.exit(1)
+        
     credential = DefaultAzureCredential()
     compute_client = ComputeManagementClient(credential, SUBSCRIPTION_ID)
 
@@ -60,18 +66,14 @@ async def start_vms():
         try:
             print(f"Starting {vm_name} in {resource_group}...")
             poller = compute_client.virtual_machines.begin_start(resource_group, vm_name)
-            result = poller.result()  # Wait for completion
-            print(f"✓ {vm_name} in {resource_group} - Running")
+            poller.result()
+            print(f"✓ {vm_name} - Running")
         except Exception as e:
-            print(f"✗ {vm_name} failed: {str(e)}")
-
-    print("🎉 All VMs processed!")
+            print(f"✗ {vm_name}: {str(e)}")
 
 if __name__ == "__main__":
-    if not check_az_login():
-        sys.exit(1)
-    
-    if input("Start VMs now? (y/N): ").lower() == 'y':
-        asyncio.run(start_vms())
-    else:
-        print("Cancelled.")
+    if check_az_login():
+        if input("\nStart VMs now? (y/N): ").lower() == 'y':
+            asyncio.run(start_vms())
+        else:
+            print("Cancelled.")
