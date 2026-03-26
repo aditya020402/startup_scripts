@@ -1,0 +1,33 @@
+stages:
+  - start-vms
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+
+start-morning-vms:
+  stage: start-vms
+  image: python:3.11
+  cache:
+    paths:
+      - .pip-cache/
+  before_script:
+    - pip install azure-identity azure-mgmt-compute
+  script:
+    - python start_vms.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  tags:
+    - docker  # Use shared runners
+  artifacts:
+    reports:
+      dotenv: vm-status.env  # Capture status vars
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+
+# Schedule trigger (9 AM IST = 3:30 AM UTC)
+vm-morning-start:
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
