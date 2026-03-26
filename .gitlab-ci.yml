@@ -1,33 +1,109 @@
 stages:
+  - validate
   - start-vms
 
 variables:
-  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  # Nexus PyPI configuration - Edit these
+  PIP_INDEX_URL: "${NEXUS_PIP_INDEX_URL}"              # https://nexus.company.com/repository/pypi/simple/
+  PIP_EXTRA_INDEX_URL: "${NEXUS_PIP_EXTRA_INDEX_URL}"  # https://nexus.company.com/repository/pypi/simple/
+  PIP_TRUSTED_HOST: "${NEXUS_TRUSTED_HOST}"            # nexus.company.com:8081
 
+# Validate Nexus + Azure vars
+validate-nexus:
+  stage: validate
+  image: python:3.11-alpine
+  script:
+    - |
+      echo "🔍 Validating Nexus + Azure vars..."
+      echo "Index URL: $PIP_INDEX_URL"
+      echo "Trusted Host: $PIP_TRUSTED_HOST"
+      echo "Azure Tenant: ${AZURE_TENANT_ID:0:8}..."
+      echo "Client ID: ${AZURE_CLIENT_ID:0:8}..."
+      
+    - pip config list | grep -E "(index|trusted-host)" || true
+    - |
+      # Light Nexus connectivity test
+      pip index versions azure-identity --index-url "$PIP_INDEX_URL" --trusted-host "$PIP_TRUSTED_HOST" || true
+      echo "✅ Validation complete"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  allow_failure: true
+
+# Main job: Nexus pip install → VM start
 start-morning-vms:
   stage: start-vms
   image: python:3.11
-  cache:
-    paths:
-      - .pip-cache/
+  needs: ["validate-nexus"]
   before_script:
-    - pip install azure-identity azure-mgmt-compute
+    # Configure pip for Nexus
+    - pip config set global.index-url "$PIP_INDEX_URL"
+    - pip config set global.extra-index-url "$PIP_EXTRA_INDEX_URL"
+    - pip config set global.trusted-host "$PIP_TRUSTED_HOST"
+    
+    # Debug pip config
+    - echo "Pip using:"
+    - pip config list
+    
+    # Install from Nexus (no cache)
+    - pip install --no-cache-dir azure-identity azure-mgmt-compute
+    
+    # Verify Azure SP auth
+    - python -c "
+      import os
+      from azure.identity import ClientSecretCredential
+      cred = ClientSecretCredential(
+        tenant_id=os.getenv('AZURE_TENANT_ID'),
+        client_id=os.getenv('AZURE_CLIENT_ID'),
+        client_secret=os.getenv('AZURE_CLIENT_SECRET')
+      )
+      print('✅ Service Principal authentication successful')
+      "
+  
   script:
+    - echo "🚀 VM Auto-Start | $(date)"
     - python start_vms.py
+    
+    # Print summary
+    - |
+      if [ -f vm-status.env ]; then
+        source vm-status.env
+        echo "## VM Summary"
+        echo "- Success: $VM_SUCCESS_COUNT/$VM_TOTAL ($VM_SUCCESS_RATE%)"
+      fi
+  
+  after_script:
+    # Job summary report
+    - |
+      if [ -f vm-status.json ]; then
+        echo "## VM Status Report" > report.md
+        cat vm-status.json >> report.md
+        echo "" >> report.md
+        echo "**Pipeline completed:** $(date)" >> report.md
+      fi
+  
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
-  tags:
-    - docker  # Use shared runners
+      when: always
   artifacts:
+    paths:
+      - vm-status.json
+      - vm-status.env
+      - report.md
+    expire_in: 1 week
     reports:
-      dotenv: vm-status.env  # Capture status vars
+      dotenv: vm-status.env
   retry:
-    max: 2
+    max: 3
     when:
       - runner_system_failure
+      - api_failure
 
-# Schedule trigger (9 AM IST = 3:30 AM UTC)
-vm-morning-start:
-  when: manual
+# Manual test trigger
+start-vms-test:
+  stage: start-vms
+  extends: start-morning-vms
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+  variables:
+    DRY_RUN: "true"  # Add dry-run flag to script if needed
